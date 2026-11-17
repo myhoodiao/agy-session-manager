@@ -1,0 +1,12 @@
+{
+  "name": "agy-session-manager",
+  "displayName": "Agy 会话检索与命名管家",
+  "description": "专职管理本机 Google Antigravity CLI (agy) 本地会话（Thread）：支持按关键词/路径/描述快速检索定位历史会话，按统一中文规范批量重命名，精准识别并清理纯测试与重复中断废会话，强制执行先只读预览、用户确认、完整备份、多处联动改写与回读核验。",
+  "version": "1.0.0",
+  "author": "myhoodiao",
+  "suggestedPrompts": [
+    "按照我们之前的约定，帮我整理一下 thread，先不执行，先给我预览",
+    "帮我找一下之前处理某问题的那个会话",
+    "盘点一下目前所有的 Agy 会话，看看有哪些废会话和需要规范命名的标题"
+  ]
+}

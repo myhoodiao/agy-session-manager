@@ -1,0 +1,15 @@
+# 本地项目维护文档（不上传至 GitHub）
+AGENTS.md
+PROJECT.md
+CHANGELOG.md
+REQUIREMENTS.md
+
+# Python 缓存与虚拟环境
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+*.bak
+*.tmp
