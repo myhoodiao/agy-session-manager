@@ -51,7 +51,9 @@ $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PluginRoot = Join-Path $env:USERPROFILE ".gemini\config\plugins\agy-session-manager"
 
 if (-not $BackupDir) {
-    if (Test-Path "D:\") {
+    if (Test-Path "D:\Project") {
+        $BackupDir = "D:\Project\agy Backups"
+    } elseif (Test-Path "D:\") {
         $BackupDir = "D:\Agy Backups"
     } else {
         $BackupDir = Join-Path $env:USERPROFILE "Agy Backups"

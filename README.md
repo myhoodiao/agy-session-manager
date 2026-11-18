@@ -20,7 +20,7 @@
 3. **清得安全（防误杀与四重安全门禁）**：
    - **防误杀硬约束**：严禁仅凭对话轮次少（如 1~2 轮）就判为废会话；必须真实读取对话首尾摘要与 `brain/<id>` 产出物，仅清理 0 轮空白会话、纯冒烟测试会话、以及重复开启后中断的无产物废会话（及无主孤立 `.lock` 残留）。
    - **一次性确认令牌门禁（`Preview -> Token -> Execute`）**：修改或删除前强制先输出**《清理排查清单》**与**《改名前后对照表》**并停下等待用户确认；未经用户下一轮明确回复确认，底层拒绝执行任何写操作。
-   - **执行前全量快照备份 + 一键回滚**：每次执行前自动将涉及的数据库、Protobuf 汇总文件、注释文件及待删会话目录完整备份至 `D:\Agy Backups\agy-session-manager-<时间戳>`（无 D 盘时自动回退至 `%USERPROFILE%\Agy Backups`），并生成 SHA-256 校验清单 `manifest.json` 与一键无损还原脚本 `restore.py`。
+   - **执行前全量快照备份 + 一键回滚**：每次执行前自动将涉及的数据库、Protobuf 汇总文件、注释文件及待删会话目录完整备份至 `D:\Project\agy Backups\agy-session-manager-<时间戳>`（无 `D:\Project` 目录时依次回退至 `D:\Agy Backups` 或 `%USERPROFILE%\Agy Backups`），并生成 SHA-256 校验清单 `manifest.json` 与一键无损还原脚本 `restore.py`。
    - **四处存储同步与回读核验**：自动联动修改 `annotations/<id>.pbtxt`、`conversation_summaries.db`（含 `raw_summary` 二进制 Protobuf 字段与 `conversations_fts` 全文表）、`jetbox_summaries_proto.pb`，并在执行后自动回读核验四处一致性。
 
 ---
@@ -65,7 +65,7 @@ agy-session-manager/
 具体要求：
 1. 先将该仓库克隆或下载到本地目录（如果你有固定的项目目录可放在项目目录下，否则可克隆到临时目录），阅读 README.md 了解插件结构与安全门禁机制；
 2. 直接运行仓库根目录下的 PowerShell 安装脚本：powershell -ExecutionPolicy Bypass -File .\install.ps1；
-3. 确认 install.ps1 中的 5 个步骤全部通过（定位本机 Python 3.10+、创建默认备份目录、部署插件到 %USERPROFILE%\.gemini\config\plugins\agy-session-manager、通过全部 5 项离线沙盒单元测试、通过 MCP JSON-RPC 握手与 4 个工具列表自检）；
+3. 确认 install.ps1 中的 5 个步骤全部通过（定位本机 Python 3.10+、创建默认备份目录、部署插件到 %USERPROFILE%\.gemini\config\plugins\agy-session-manager、通过全部离线沙盒单元测试、通过 MCP JSON-RPC 握手与 4 个工具列表自检）；
 4. 安装完成后，只读调用一次 session_manager.py --scan，告诉我当前这台电脑上共有多少条 Agy 本地会话，先不要做任何修改或删除。
 ```
 
@@ -83,7 +83,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 `install.ps1` 会自动完成以下工作（支持重复运行，幂等安全）：
 1. 自动探测本机可用的 `python.exe`（自动避开 WindowsApps 商店空壳占位符，校验版本 `>= 3.10`）；
-2. 自动准备默认备份目录（存在 `D:\` 时默认使用 `D:\Agy Backups`，无 `D:\` 时自动使用 `%USERPROFILE%\Agy Backups`；也可通过 `-BackupDir "路径"` 自定义）；
+2. 自动准备默认备份目录（存在 `D:\Project` 时优先使用 `D:\Project\agy Backups`，其次使用 `D:\Agy Backups`，无 `D:\` 时自动使用 `%USERPROFILE%\Agy Backups`；也可通过 `-BackupDir "路径"` 自定义）；
 3. 将插件配置、MCP 脚本、技能 `SKILL.md` 及门禁规则 `rules/AGENTS.md` 完整部署到 `%USERPROFILE%\.gemini\config\plugins\agy-session-manager`（即使克隆在临时目录，安装后删除临时目录也不影响插件独立运行）；
 4. 自动生成适配当前电脑真实 Python 路径与备份目录的 `mcp_config.json`（UTF-8 无 BOM）；
 5. 自动在临时沙盒目录中运行 `tests/test_session_manager.py` 全部单元测试，并执行 MCP JSON-RPC `initialize` 与 `tools/list` 握手自检。
@@ -127,6 +127,19 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
    ```powershell
    python -B -X utf8 -m unittest discover -s .\tests -v
    ```
+
+---
+
+### 已有设备如何拉取更新（升级插件）
+
+如果另一台 Windows 设备已经克隆并安装过本插件，只需在原克隆目录拉取最新代码并重新运行一次安装脚本（幂等覆盖），即可自动更新脚本、规则与全部自检：
+
+```powershell
+git pull
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+更新完成后，**新开或重启 `agy` 终端窗口**即可生效。
 
 ---
 
@@ -195,8 +208,9 @@ python "D:\Agy Backups\agy-session-manager-20261115_012245_354\restore.py"
 2. **为什么删除会话不能只删 SQLite 行？**
    - 若仅从 `conversation_summaries.db` 删除记录而保留 `conversations/<id>.db`，`agy` 的后台 `reconcile` 扫描磁盘时会把该会话重新扫回列表。
    - 因此清理会话时，引擎在完成完整备份后，会同步移除 `conversation_summaries`、`conversations_fts`、`conversation_parents`、`jetbox_summaries_proto.pb` 中的条目，以及磁盘上的 `conversations/<id>.db*`、`brain/<id>/`、`annotations/<id>.pbtxt`、`presence/<id>.lock`。
-3. **运行中终端的文件锁检测与保护（`msvcrt.locking`）**：
-   - 正在运行的 `agy.exe` 进程会对当前会话的 `presence/<id>.lock` 持有 Windows 系统级字节锁。
-   - 引擎通过 `msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)` 无损探测每个会话是否仍在某个终端窗口中打开：
+3. **运行中终端的锁探测、原生 `fsnotify` 同步与底稿自愈对账（`reconcile_disk_truth`）**：
+   - 正在运行的 `agy.exe` 进程会对当前会话的 `presence/<id>.lock` 持有 Windows 系统级字节锁，同时在内存中缓存 `jetbox_summaries_proto.pb` 的旧会话总表并在回合结束或退出时写回硬盘。
+   - 引擎通过 `msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)` 无损探测锁状态并做了三重防护：
      - **待清理会话若仍被锁占用**：预览表会标出 `⚠️ 终端未关闭（执行前需先关）`，执行阶段若发现未关会主动拦截并保持零改动，绝不破坏运行中的进程。
-     - **当前正在对话的活跃会话若需重命名**：由于当前 `agy` 进程在本轮回复结束瞬间会将内存中的旧标题往数据库回写一次，引擎除当场更新外，会自动启动一个轻量后台子进程在 `3.5s` 和 `7.0s` 后（即本轮回复落盘结束后）自动补刷一次新标题，彻底解决当前窗口改名被覆写的问题。
+     - **触发 `agy.exe` 原生 `fsnotify` 内存清理**：清理原本无 `conversations/<id>.db` 的 0 步空会话或幽灵条目时，短暂创建并删除 0 字节 `<id>.db` 文件以触发运行中进程的 `DeleteSummary` 监听事件。
+     - **以磁盘底稿为准的幂等自愈对账（无常驻轮询进程）**：以磁盘上的 `conversations/<id>.db`（管生死）和 `annotations/<id>.pbtxt`（管中文标题）作为真值源；在 MCP 启动握手（`initialize`）、每次 `scan`/`search`/`preview`、以及存在活跃会话时的本轮收尾延迟同步（`3.5s` 和 `7.0s` 后退出）自动执行毫秒级幂等对账，自动剔除 CLI 空壳幽灵记录并把被旧进程覆写回退的标题刷回 `conversation_summaries.db`、`conversations_fts`、`jetbox_summaries_proto.pb` 与 `cache/conversation_metadata.json`（同时完整保留桌面端 IDE 记录）。

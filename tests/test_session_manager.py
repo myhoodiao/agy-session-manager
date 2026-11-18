@@ -275,6 +275,106 @@ class SessionManagerTestCase(unittest.TestCase):
         titles_by_id = {s["conversation_id"]: s["effective_title"] for s in after_restore["sessions"]}
         self.assertEqual(titles_by_id[self.cid_keep], "English Old Title")
 
+    def test_reconcile_disk_truth_heals_overwritten_pb_and_ghosts(self) -> None:
+        new_title = "DemoProj-架构文档梳理与基线建立"
+        preview = sm.preview_changes(
+            renames=[
+                {
+                    "conversation_id": self.cid_keep,
+                    "new_title": new_title,
+                    "category": "项目类",
+                }
+            ],
+            deletes=[
+                {
+                    "conversation_id": self.cid_delete,
+                    "reason": "纯冒烟测试会话，无业务成果",
+                }
+            ],
+            clean_orphans=True,
+        )
+        exec_res = sm.execute_changes(preview["confirmation_token"], "同意，执行整理")
+        self.assertTrue(exec_res["verification"]["passed"])
+        self.assertFalse((self.data_dir / "conversations" / f"{self.cid_delete}.db").exists())
+
+        # 模拟运行中旧 agy.exe 覆写回滚：把 cid_keep 改回英文旧名，并把已删的 cid_delete 塞回 db 和 pb
+        old_raw_keep = _build_sample_raw_summary(self.cid_keep, "English Old Title", 20)
+        old_raw_del = _build_sample_raw_summary(self.cid_delete, "只回复：测试完成", 2)
+
+        db_path = self.data_dir / "conversation_summaries.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                """
+                UPDATE conversation_summaries
+                SET title = ?, preview = ?, raw_summary = ?
+                WHERE conversation_id = ?
+                """,
+                ("English Old Title", "English Old Title", old_raw_keep, self.cid_keep),
+            )
+            conn.execute(
+                "UPDATE conversations_fts SET title = ? WHERE conversation_id = ?",
+                ("English Old Title", self.cid_keep),
+            )
+            conn.execute(
+                "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    self.cid_delete,
+                    "",
+                    "只回复：测试完成",
+                    2,
+                    "2026-11-14 14:00:00+00:00",
+                    '["file:///C:/Temp/smoke"]',
+                    "",
+                    old_raw_del,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        pb_path = self.data_dir / "jetbox_summaries_proto.pb"
+        pb_bytes = sm.encode_proto_fields([
+            (1, 2, sm.encode_proto_fields([(1, 2, self.cid_keep.encode()), (2, 2, old_raw_keep)])),
+            (1, 2, sm.encode_proto_fields([(1, 2, self.cid_delete.encode()), (2, 2, old_raw_del)])),
+        ])
+        pb_path.write_bytes(pb_bytes)
+
+        # 调用 scan_sessions 应自动触发底稿自愈：剔除幽灵 cid_delete，并把 cid_keep 全部恢复为新中文名
+        healed = sm.scan_sessions()
+        self.assertEqual(healed["session_count"], 1)
+        self.assertEqual(healed["sessions"][0]["conversation_id"], self.cid_keep)
+        self.assertEqual(healed["sessions"][0]["effective_title"], new_title)
+
+        conn_ro = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = conn_ro.execute(
+                "SELECT title, preview, raw_summary FROM conversation_summaries WHERE conversation_id = ?",
+                (self.cid_keep,),
+            ).fetchone()
+            self.assertEqual(row[0], new_title)
+            self.assertEqual(row[1], new_title)
+            self.assertEqual(sm.extract_raw_summary_titles(row[2]), (new_title, new_title))
+
+            fts_row = conn_ro.execute(
+                "SELECT title FROM conversations_fts WHERE conversation_id = ?",
+                (self.cid_keep,),
+            ).fetchone()
+            self.assertEqual(fts_row[0], new_title)
+
+            ghost_row = conn_ro.execute(
+                "SELECT 1 FROM conversation_summaries WHERE conversation_id = ?",
+                (self.cid_delete,),
+            ).fetchone()
+            self.assertIsNone(ghost_row)
+        finally:
+            conn_ro.close()
+
+        pb_map = sm.parse_jetbox_pb(pb_path.read_bytes())
+        self.assertNotIn(self.cid_delete, pb_map)
+        self.assertIn(self.cid_keep, pb_map)
+        self.assertEqual(sm.extract_raw_summary_titles(pb_map[self.cid_keep]), (new_title, new_title))
+
     def test_mcp_jsonrpc_handlers(self) -> None:
         os.environ["AGY_SESSION_MANAGER_ROOT"] = str(PROJECT_ROOT)
         init_resp = mcp.handle_jsonrpc_message(

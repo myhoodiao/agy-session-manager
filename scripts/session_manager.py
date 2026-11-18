@@ -30,7 +30,9 @@ from typing import Any
 
 DEFAULT_DATA_DIR = Path.home() / ".gemini" / "antigravity-cli"
 DEFAULT_BACKUP_ROOT = (
-    Path(r"D:\Agy Backups") if Path("D:/").exists() else (Path.home() / "Agy Backups")
+    Path(r"D:\Project\agy Backups")
+    if Path(r"D:\Project").exists()
+    else (Path(r"D:\Agy Backups") if Path("D:/").exists() else (Path.home() / "Agy Backups"))
 )
 TOKEN_TTL_SECONDS = 1800
 MAX_TITLE_CHARS = 25
@@ -500,11 +502,275 @@ def _compute_session_bytes(data_dir: Path, cid: str) -> int:
     return total
 
 
-def scan_sessions(data_dir: Path | None = None) -> dict[str, Any]:
+def _get_summaries_table_columns(conn: sqlite3.Connection) -> set[str]:
+    rows = conn.execute("PRAGMA table_info(conversation_summaries)").fetchall()
+    return {str(row[1]) for row in rows if len(row) > 1}
+
+
+def _update_metadata_cache(
+    data_dir: Path,
+    title_updates: dict[str, str],
+    deleted_ids: set[str],
+) -> None:
+    cache_path = data_dir / "cache" / "conversation_metadata.json"
+    if not cache_path.is_file() or (not title_updates and not deleted_ids):
+        return
+    try:
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(raw, dict):
+        return
+    convs = raw.get("conversations")
+    if not isinstance(convs, dict):
+        return
+
+    changed = False
+    for cid in deleted_ids:
+        if cid in convs:
+            convs.pop(cid, None)
+            changed = True
+
+    for cid, new_title in title_updates.items():
+        if cid in deleted_ids:
+            continue
+        entry = convs.get(cid)
+        if isinstance(entry, dict):
+            summary = entry.get("summary")
+            if isinstance(summary, dict) and summary.get("Title") != new_title:
+                summary["Title"] = new_title
+                changed = True
+
+    if changed:
+        tmp_path = cache_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, cache_path)
+
+
+def _notify_watcher_deleted(data_dir: Path, deleted_ids: set[str]) -> None:
     """
-    只读盘点本机全部 Agy CLI 会话与孤立残留文件。
+    针对磁盘原本无 conversations/<id>.db 的待删/幽灵条目，短暂创建并删除 0 字节 .db 文件，
+    以触发运行中 agy.exe 的 fsnotify 删除事件（DeleteSummary），主动清理其内存缓存。
+    """
+    if not deleted_ids:
+        return
+    conv_dir = data_dir / "conversations"
+    if not conv_dir.is_dir():
+        return
+    for cid in deleted_ids:
+        if not cid or "/" in cid or "\\" in cid:
+            continue
+        db_p = conv_dir / f"{cid}.db"
+        if db_p.exists():
+            continue
+        created = False
+        try:
+            db_p.write_bytes(b"")
+            created = True
+        except OSError:
+            pass
+        finally:
+            if created:
+                try:
+                    db_p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
+def reconcile_disk_truth(data_dir: Path | None = None) -> dict[str, Any]:
+    """
+    以磁盘底稿（conversations/<id>.db 管生死，annotations/<id>.pbtxt 管标题）为真值源，
+    幂等清理 CLI 空壳幽灵记录并自愈被旧进程覆盖回退的标题分裂。
     """
     base = resolve_data_dir(data_dir)
+    conv_dir = base / "conversations"
+    ann_dir = base / "annotations"
+    db_path = base / "conversation_summaries.db"
+    pb_path = base / "jetbox_summaries_proto.pb"
+
+    valid_conv_ids = {p.stem for p in conv_dir.glob("*.db")} if conv_dir.is_dir() else set()
+
+    pb_bytes = b""
+    pb_map: dict[str, bytes] = {}
+    if pb_path.is_file():
+        try:
+            pb_bytes = pb_path.read_bytes()
+            pb_map = parse_jetbox_pb(pb_bytes)
+        except Exception:
+            pb_bytes = b""
+            pb_map = {}
+
+    db_info: dict[str, dict[str, Any]] = {}
+    fts_titles: dict[str, set[str]] = {}
+    non_cli_ids: set[str] = set()
+
+    if db_path.is_file():
+        conn_ro = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        try:
+            cols = _get_summaries_table_columns(conn_ro)
+            has_app_col = "app_data_dir" in cols
+            has_depth_col = "nesting_depth" in cols
+            select_cols = ["conversation_id", "title", "preview", "raw_summary"]
+            if has_app_col:
+                select_cols.append("app_data_dir")
+            if has_depth_col:
+                select_cols.append("nesting_depth")
+            sql = f"SELECT {', '.join(select_cols)} FROM conversation_summaries"
+            for row in conn_ro.execute(sql):
+                cid = row[0]
+                if not cid:
+                    continue
+                idx = 4
+                app_dir = ""
+                depth = 0
+                if has_app_col:
+                    app_dir = str(row[idx] or "")
+                    idx += 1
+                if has_depth_col:
+                    depth = int(row[idx] or 0)
+                if (has_app_col and app_dir not in ("", "antigravity-cli")) or (
+                    has_depth_col and depth != 0
+                ):
+                    non_cli_ids.add(cid)
+                raw_bytes = row[3] or b""
+                f1, f15 = extract_raw_summary_titles(raw_bytes)
+                db_info[cid] = {
+                    "title": row[1] or "",
+                    "preview": row[2] or "",
+                    "raw_bytes": raw_bytes,
+                    "raw_f1": f1,
+                    "raw_f15": f15,
+                }
+            for fcid, ftitle in conn_ro.execute("SELECT conversation_id, title FROM conversations_fts"):
+                if fcid:
+                    fts_titles.setdefault(fcid, set()).add(ftitle or "")
+        finally:
+            conn_ro.close()
+
+    # 移除属于非 CLI 会话且无本地 .db 的误植 annotations/*.pbtxt
+    if ann_dir.is_dir() and non_cli_ids:
+        for ann_p in ann_dir.glob("*.pbtxt"):
+            if ann_p.stem in non_cli_ids and ann_p.stem not in valid_conv_ids:
+                try:
+                    ann_p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    # 识别并剔除 CLI 空壳幽灵记录
+    candidate_ids = (set(db_info.keys()) | set(pb_map.keys())) - non_cli_ids - valid_conv_ids
+    ghost_cli_ids: set[str] = {
+        cid for cid in candidate_ids if not is_session_locked(base, cid)
+    }
+
+    # 识别有效 CLI 会话中的分裂标题
+    ann_titles: dict[str, str] = {}
+    title_repairs: list[dict[str, str]] = []
+    db_title_updates: dict[str, tuple[str, bytes]] = {}
+    fts_title_updates: dict[str, str] = {}
+    pb_updates: dict[str, bytes] = {}
+
+    if ann_dir.is_dir():
+        for cid in sorted(valid_conv_ids):
+            if cid in non_cli_ids:
+                continue
+            ann_p = ann_dir / f"{cid}.pbtxt"
+            if not ann_p.is_file():
+                continue
+            try:
+                ann_title = parse_annotation_pbtxt(ann_p.read_bytes()).strip()
+            except Exception:
+                continue
+            if not ann_title:
+                continue
+            ann_titles[cid] = ann_title
+
+            db_mismatch = False
+            if cid in db_info:
+                d = db_info[cid]
+                if (
+                    d["title"] != ann_title
+                    or d["preview"] != ann_title
+                    or d["raw_f1"] != ann_title
+                    or d["raw_f15"] != ann_title
+                ):
+                    db_mismatch = True
+
+            fts_mismatch = cid in fts_titles and any(t != ann_title for t in fts_titles[cid])
+
+            pb_mismatch = False
+            if cid in pb_map:
+                pf1, pf15 = extract_raw_summary_titles(pb_map[cid])
+                if pf1 != ann_title or pf15 != ann_title:
+                    pb_mismatch = True
+
+            if db_mismatch or fts_mismatch or pb_mismatch:
+                base_raw = (
+                    db_info[cid]["raw_bytes"]
+                    if (cid in db_info and db_info[cid]["raw_bytes"])
+                    else pb_map.get(cid, b"")
+                )
+                new_raw = update_raw_summary_title(base_raw, ann_title)
+                if db_mismatch:
+                    db_title_updates[cid] = (ann_title, new_raw)
+                if fts_mismatch:
+                    fts_title_updates[cid] = ann_title
+                if pb_mismatch or (cid in pb_map and db_mismatch):
+                    pb_updates[cid] = new_raw
+                title_repairs.append({"conversation_id": cid, "repaired_title": ann_title})
+
+    if db_path.is_file() and (ghost_cli_ids or db_title_updates or fts_title_updates):
+        conn = sqlite3.connect(str(db_path), timeout=15.0)
+        try:
+            cur = conn.cursor()
+            for cid, (new_title, new_raw) in db_title_updates.items():
+                cur.execute(
+                    """
+                    UPDATE conversation_summaries
+                    SET title = ?, preview = ?, raw_summary = ?
+                    WHERE conversation_id = ?
+                    """,
+                    (new_title, new_title, new_raw, cid),
+                )
+            for cid, new_title in fts_title_updates.items():
+                cur.execute(
+                    "UPDATE conversations_fts SET title = ? WHERE conversation_id = ?",
+                    (new_title, cid),
+                )
+            for cid in ghost_cli_ids:
+                cur.execute("DELETE FROM conversation_summaries WHERE conversation_id = ?", (cid,))
+                cur.execute("DELETE FROM conversations_fts WHERE conversation_id = ?", (cid,))
+                cur.execute(
+                    "DELETE FROM conversation_parents WHERE conversation_id = ? OR parent_id = ?",
+                    (cid, cid),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    pb_deleted_ids = {cid for cid in ghost_cli_ids if cid in pb_map}
+    if pb_path.is_file() and (pb_deleted_ids or pb_updates):
+        new_pb_bytes = update_jetbox_pb_bytes(pb_bytes, pb_updates, pb_deleted_ids)
+        pb_tmp = pb_path.with_suffix(".pb.tmp")
+        pb_tmp.write_bytes(new_pb_bytes)
+        os.replace(pb_tmp, pb_path)
+
+    if pb_deleted_ids:
+        _notify_watcher_deleted(base, pb_deleted_ids)
+
+    _update_metadata_cache(base, ann_titles, ghost_cli_ids)
+
+    return {
+        "purged_ghost_ids": sorted(ghost_cli_ids),
+        "repaired_titles": title_repairs,
+    }
+
+
+def scan_sessions(data_dir: Path | None = None) -> dict[str, Any]:
+    """
+    只读盘点本机全部 Agy CLI 会话与孤立残留文件（盘点前先执行幂等底稿自愈对账）。
+    """
+    base = resolve_data_dir(data_dir)
+    reconcile_disk_truth(base)
     db_path = base / "conversation_summaries.db"
     pb_path = base / "jetbox_summaries_proto.pb"
 
@@ -517,15 +783,35 @@ def scan_sessions(data_dir: Path | None = None) -> dict[str, Any]:
 
     db_rows: dict[str, dict[str, Any]] = {}
     fts_ids: set[str] = set()
+    non_cli_ids: set[str] = set()
     if db_path.is_file():
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         try:
             cur = conn.cursor()
+            cols = _get_summaries_table_columns(conn)
+            where_clauses: list[str] = []
+            non_cli_clauses: list[str] = []
+            if "app_data_dir" in cols:
+                where_clauses.append("app_data_dir IN ('', 'antigravity-cli')")
+                non_cli_clauses.append("app_data_dir NOT IN ('', 'antigravity-cli')")
+            if "nesting_depth" in cols:
+                where_clauses.append("nesting_depth = 0")
+                non_cli_clauses.append("nesting_depth != 0")
+
+            if non_cli_clauses:
+                for (ncid,) in cur.execute(
+                    f"SELECT conversation_id FROM conversation_summaries WHERE {' OR '.join(non_cli_clauses)}"
+                ):
+                    if ncid:
+                        non_cli_ids.add(ncid)
+
+            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
             for row in cur.execute(
-                """
+                f"""
                 SELECT conversation_id, title, preview, step_count,
                        last_modified_time, workspace_uris, parent_conversation_id, raw_summary
                 FROM conversation_summaries
+                {where_sql}
                 ORDER BY last_modified_time DESC
                 """
             ):
@@ -613,7 +899,7 @@ def scan_sessions(data_dir: Path | None = None) -> dict[str, Any]:
         })
 
     all_disk_ids = fts_ids | set(pb_map.keys()) | conv_ids | brain_ids | ann_ids | lock_ids
-    orphan_ids = sorted(all_disk_ids - set(db_rows.keys()))
+    orphan_ids = sorted(all_disk_ids - set(db_rows.keys()) - non_cli_ids)
     orphans: list[dict[str, Any]] = []
     for ocid in orphan_ids:
         locs = []
@@ -1156,11 +1442,15 @@ def create_backup_snapshot(
                     rel = sp.relative_to(data_dir)
                     _copy_and_record(sp, files_dir / rel, data_dir, records)
 
+    existing_annotations = (
+        sorted(p.name for p in ann_dir.glob("*.pbtxt")) if ann_dir.is_dir() else []
+    )
     manifest = {
         "created_at": dt.datetime.now().isoformat(),
         "data_dir": str(data_dir),
         "backup_dir": str(snap_dir),
         "deleted_conversation_ids": delete_ids,
+        "existing_annotations": existing_annotations,
         "file_count": len(records),
         "total_bytes": sum(r["size_bytes"] for r in records),
         "files": records,
@@ -1200,6 +1490,14 @@ def main() -> None:
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
         restored += 1
+
+    if "existing_annotations" in manifest:
+        keep_anns = set(manifest["existing_annotations"])
+        ann_dir = target_root / "annotations"
+        if ann_dir.is_dir():
+            for p in ann_dir.glob("*.pbtxt"):
+                if p.name not in keep_anns:
+                    p.unlink()
 
     print(f"已成功还原 {restored} 个文件至 {target_root}")
 
@@ -1261,11 +1559,9 @@ def apply_single_rename_on_disk(data_dir: Path, cid: str, new_title: str) -> Non
 
 def _spawn_delayed_rename_sync(data_dir: Path, locked_renames: list[tuple[str, str]]) -> None:
     """
-    对于当前正在运行的活跃会话，在当前轮次结束后（3.5s 与 7.0s）自动补刷一次标题，
-    防止活跃进程在回合结束时用内存中的旧标题覆写数据库。
+    当存在运行中的活跃终端会话时，在当前轮次结束后（3.5s 与 7.0s）自动补刷并执行全量底稿对账，
+    防止活跃进程在回合结束时用内存中的旧标题或旧条目覆写数据库与缓存。
     """
-    if not locked_renames:
-        return
     payload = json.dumps(
         {"data_dir": str(data_dir), "renames": locked_renames},
         ensure_ascii=False,
@@ -1357,6 +1653,9 @@ def execute_changes(
 
     # 2. 创建完整备份快照（含 SHA-256 校验与 restore.py）
     all_delete_ids = [d["conversation_id"] for d in deletes] + list(orphan_ids)
+    missing_conv_db_before_delete = [
+        cid for cid in all_delete_ids if not (target_dir / "conversations" / f"{cid}.db").is_file()
+    ]
     freed_bytes_Logical = sum(_compute_session_bytes(target_dir, cid) for cid in all_delete_ids)
     backup_dir = create_backup_snapshot(target_dir, all_delete_ids, backup_root=backup_root)
 
@@ -1435,7 +1734,7 @@ def execute_changes(
         pb_tmp.write_bytes(new_pb_bytes)
         os.replace(pb_tmp, pb_path)
 
-    # 3.4 删除磁盘上的会话文件与目录
+    # 3.4 删除磁盘上的会话文件与目录，并通知运行中 watcher 清理无 .db 幽灵条目
     for cid in all_delete_ids:
         for suffix in (".db", ".db-wal", ".db-shm"):
             p = target_dir / "conversations" / f"{cid}{suffix}"
@@ -1451,9 +1750,31 @@ def execute_changes(
         if brain_p.is_dir():
             shutil.rmtree(brain_p)
 
-    # 3.5 若有当前活跃会话被重命名，启动后台延迟同步进程
-    if locked_renames_for_delayed_sync:
+    if missing_conv_db_before_delete:
+        _notify_watcher_deleted(target_dir, set(missing_conv_db_before_delete))
+
+    _update_metadata_cache(
+        target_dir,
+        {r["conversation_id"]: r["new_title"] for r in renames},
+        delete_set,
+    )
+
+    # 3.5 只要存在运行中的活跃终端会话，启动本轮收尾延迟同步（3.5s 与 7.0s）
+    active_locked_ids: list[str] = []
+    presence_dir = target_dir / "presence"
+    if presence_dir.is_dir():
+        for lp in sorted(presence_dir.glob("*.lock")):
+            lcid = lp.stem
+            if lcid not in delete_set and is_session_locked(target_dir, lcid):
+                active_locked_ids.append(lcid)
+
+    delayed_sync_sessions = list(
+        dict.fromkeys([cid for cid, _ in locked_renames_for_delayed_sync] + active_locked_ids)
+    )
+    if delayed_sync_sessions and (renames or all_delete_ids):
         _spawn_delayed_rename_sync(target_dir, locked_renames_for_delayed_sync)
+    else:
+        delayed_sync_sessions = []
 
     # 4. 执行后回读核验（Read-back Verification）
     verification = verify_execution_state(
@@ -1470,7 +1791,7 @@ def execute_changes(
         "deleted_session_count": len(deletes),
         "deleted_orphan_count": len(orphan_ids),
         "freed_logical_bytes": freed_bytes_Logical,
-        "delayed_sync_sessions": [cid for cid, _ in locked_renames_for_delayed_sync],
+        "delayed_sync_sessions": delayed_sync_sessions,
         "verification": verification,
     }
 
@@ -1569,7 +1890,7 @@ def verify_execution_state(
 def _run_delayed_sync_cli(payload_json: str) -> None:
     data = json.loads(payload_json)
     target_dir = Path(data["data_dir"])
-    renames: list[list[str]] = data["renames"]
+    renames: list[list[str]] = data.get("renames") or []
     for delay in (3.5, 7.0):
         time.sleep(delay)
         for cid, new_title in renames:
@@ -1577,6 +1898,10 @@ def _run_delayed_sync_cli(payload_json: str) -> None:
                 apply_single_rename_on_disk(target_dir, cid, new_title)
             except Exception:
                 pass
+        try:
+            reconcile_disk_truth(target_dir)
+        except Exception:
+            pass
 
 
 def main() -> None:

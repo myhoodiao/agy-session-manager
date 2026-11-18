@@ -280,6 +280,12 @@ def handle_jsonrpc_message(msg: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     if method == "initialize":
+        try:
+            sm = load_backend_module()
+            with contextlib.redirect_stdout(sys.stderr):
+                sm.reconcile_disk_truth()
+        except Exception:
+            pass
         client_ver = params.get("protocolVersion")
         negotiated = (
             client_ver
